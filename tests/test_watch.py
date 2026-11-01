@@ -243,6 +243,51 @@ class PlaybackTests(unittest.TestCase):
         self.until(step)
         self.assertEqual(frame.evaluate('window.playClicks'), 1)
 
+    def test_video_quiz_notice_then_next_video_play(self):
+        frame = self.page.frames[1]
+        frame.evaluate("""() => {
+            sessionStorage.setItem('nextPlayer', 'notice.html');
+            document.querySelector('#next').onclick = () => location.href = 'quiz.html';
+        }""")
+        watcher = Watcher(self.page)
+
+        def step():
+            watcher.tick()
+            video = find_video(self.page)
+            return (self.page.frames[1].url.endswith('gated.html') and video is not None
+                    and video_state(video)['time'] > 0 and not video_state(video)['paused'])
+
+        self.until(step)
+        frame = self.page.frames[1]
+        self.assertEqual(frame.evaluate("sessionStorage.getItem('noticeNextClicks')"), '1')
+        self.assertEqual(frame.evaluate("sessionStorage.getItem('noticeStudyClicks')"), '0')
+        self.assertEqual(frame.evaluate("sessionStorage.getItem('noticeBackgroundClicks')"), '0')
+        self.assertEqual(frame.evaluate("sessionStorage.getItem('quizSubmissions')"), '0')
+        self.assertEqual(frame.evaluate('window.playClicks'), 1)
+
+    def test_confirmation_in_main_page_clicked_once_until_hidden(self):
+        self.page.goto(self.base + '/notice.html')
+        self.page.evaluate("() => { document.querySelector('#confirm-next').onclick = () => window.confirmClicks++; }")
+        watcher = Watcher(self.page, next_selector='#background-next')
+        for _ in range(3):
+            watcher.tick()
+        self.assertEqual(self.page.evaluate('window.confirmClicks'), 1)
+        self.assertEqual(self.page.evaluate('window.studyClicks'), 0)
+        self.assertEqual(self.page.evaluate('window.backgroundClicks'), 0)
+        self.page.locator('#overlay').evaluate("e => e.style.display = 'none'")
+        watcher.tick()
+        self.page.locator('#overlay').evaluate("e => e.style.display = ''")
+        watcher.tick()
+        self.assertEqual(self.page.evaluate('window.confirmClicks'), 2)
+
+    def test_unrelated_notification_is_not_confirmed(self):
+        self.page.goto(self.base + '/notice.html')
+        self.page.locator('#notice p').evaluate("e => e.textContent = '确定要退出登录吗？'")
+        watcher = Watcher(self.page)
+        watcher.tick()
+        self.assertEqual(self.page.evaluate('window.confirmClicks'), 0)
+        self.assertEqual(self.page.evaluate('window.studyClicks'), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,24 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Unfinished tasks confirmation</title>
+<button id="background-next" onclick="window.backgroundClicks++">下一节</button>
+<div id="overlay" style="position:fixed;inset:0;background:#eee;z-index:10">
+  <div id="notice" style="margin:50px;background:white;padding:24px">
+    <header>提示</header>
+    <p>当前章节还有任务点未完成，是否去完成?</p>
+    <button id="study" onclick="window.studyClicks++">去学习</button>
+    <button id="confirm-next" onclick="confirmNext()"><span>下一节</span></button>
+  </div>
+</div>
+<script>
+window.backgroundClicks = 0;
+window.studyClicks = 0;
+window.confirmClicks = 0;
+function confirmNext() {
+  window.confirmClicks++;
+  sessionStorage.setItem('noticeNextClicks', window.confirmClicks);
+  sessionStorage.setItem('noticeStudyClicks', window.studyClicks);
+  sessionStorage.setItem('noticeBackgroundClicks', window.backgroundClicks);
+  location.href = 'gated.html';
+}
+</script>

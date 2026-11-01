@@ -16,6 +16,7 @@ NEXT_NAME = re.compile(
 )
 QUIZ_NAME = re.compile(r"章节测验|章节测试|课后测验|随堂测验|本章测试|单元测验|章节作业|随堂测试")
 PLAY_NAME = re.compile(r"^\s*(?:播放|播放视频|开始播放|Play|Play video|Start video|Воспроизвести)\s*$", re.I)
+UNFINISHED_NOTICE = re.compile(r"当前章节还有任务点未完成\s*[，,]\s*是否去完成\s*[?？]?")
 ROOT = Path(__file__).resolve().parent
 
 
@@ -149,6 +150,36 @@ def quiz_page_key(page):
     return None
 
 
+def unfinished_notices(page):
+    """Find only the shown unfinished-task confirmation and its own Next control."""
+    for frame in page.frames:
+        try:
+            for message in frame.get_by_text(UNFINISHED_NOTICE).all():
+                if not message.is_visible():
+                    continue
+                key = message.evaluate("""e => {
+                    window.__watchNoticeIds ??= new WeakMap();
+                    if (!window.__watchNoticeIds.has(e))
+                        window.__watchNoticeIds.set(e, crypto.randomUUID());
+                    return window.__watchNoticeIds.get(e);
+                }""")
+                # No dependency on modal CSS classes or ARIA roles. Do not search
+                # the whole page: it may have a different 下一节 behind the modal.
+                container = message.locator(
+                    "xpath=ancestor::*[not(self::body) and not(self::html)]"
+                    "[.//*[normalize-space(.)='下一节']][1]"
+                )
+                control = None
+                if container.count():
+                    for candidate in container.get_by_text(re.compile(r"^\s*下一节\s*$")).all():
+                        if candidate.is_visible() and candidate.is_enabled():
+                            control = candidate
+                            break
+                yield key, control
+        except Error:
+            continue
+
+
 class Watcher:
     def __init__(self, page, next_selector=None, video_selector="video", transition_timeout=45, play_selector=None):
         self.page = page
@@ -169,6 +200,24 @@ class Watcher:
         self.quiz_candidate = None
         self.quiz_since = 0.0
         self.skipped_quizzes = set()
+        self.confirmed_notices = set()
+
+    def confirm_unfinished_notice(self):
+        notices = list(unfinished_notices(self.page))
+        visible_keys = {key for key, _ in notices}
+        self.confirmed_notices.intersection_update(visible_keys)
+        for key, control in notices:
+            if key in self.confirmed_notices:
+                continue
+            if control is None:
+                self.notice("Есть уведомление о незавершённых заданиях; жду кнопку 下一节 внутри окна.")
+                continue
+            control.click(timeout=3000)
+            self.confirmed_notices.add(key)
+            self.pending_since = time.monotonic()
+            LOG.info("Уведомление о незавершённых заданиях: нажал 下一节 внутри окна.")
+            break
+        return bool(notices)
 
     def skip_quiz(self):
         key = quiz_page_key(self.page)
@@ -197,6 +246,9 @@ class Watcher:
             self.notice_at = now
 
     def tick(self):
+        # The modal blocks the player and navigation, so handle it first.
+        if self.confirm_unfinished_notice():
+            return
         video = find_video(self.page, self.video_selector, self.play_selector)
         if video is None:
             if self.skip_quiz():
