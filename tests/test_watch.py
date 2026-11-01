@@ -194,6 +194,55 @@ class PlaybackTests(unittest.TestCase):
         watcher.tick()
         self.assertEqual(self.page.evaluate('window.nextClicks'), 0)
 
+    def test_play_button_after_video_and_quiz_loads_uninitialized_video(self):
+        frame = self.page.frames[1]
+        frame.evaluate("""() => {
+            sessionStorage.setItem('nextPlayer', 'gated.html');
+            document.querySelector('#next').onclick = () => location.href = 'quiz.html';
+        }""")
+        watcher = Watcher(self.page)
+
+        def step():
+            watcher.tick()
+            video = find_video(self.page)
+            return (self.page.frames[1].url.endswith('gated.html') and video is not None
+                    and video_state(video)['time'] > 0 and not video_state(video)['paused'])
+
+        self.until(step)
+        frame = self.page.frames[1]
+        self.assertEqual(frame.evaluate('window.playClicks'), 1)
+        self.assertEqual(frame.evaluate("sessionStorage.getItem('quizAnswered')"), 'false')
+        self.assertEqual(frame.evaluate("sessionStorage.getItem('quizSubmissions')"), '0')
+
+    def test_hidden_video_starts_by_clicking_poster(self):
+        frame = self.page.frames[1]
+        frame.goto(self.base + '/gated.html?hidden')
+        video = find_video(self.page)
+        self.assertIsNotNone(video)
+        self.assertEqual(video_state(video)['ready'], 0)
+        watcher = Watcher(self.page)
+
+        def step():
+            watcher.tick()
+            state = video_state(video)
+            return state['time'] > 0 and not state['paused']
+
+        self.until(step)
+        self.assertEqual(frame.evaluate('window.playClicks'), 1)
+
+    def test_explicit_play_selector_for_custom_icon(self):
+        frame = self.page.frames[1]
+        frame.goto(self.base + '/gated.html')
+        frame.locator('button').evaluate("b => { b.className = 'custom-start'; b.removeAttribute('aria-label'); }")
+        watcher = Watcher(self.page, play_selector='.custom-start')
+
+        def step():
+            watcher.tick()
+            return video_state(find_video(self.page))['time'] > 0
+
+        self.until(step)
+        self.assertEqual(frame.evaluate('window.playClicks'), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

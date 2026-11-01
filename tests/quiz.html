@@ -14,6 +14,6 @@ function nextLesson() {
   window.nextClicks++;
   sessionStorage.setItem('quizAnswered', document.querySelector('input').checked);
   sessionStorage.setItem('quizSubmissions', window.quizSubmissions);
-  location.href = 'player.html';
+  location.href = sessionStorage.getItem('nextPlayer') || 'player.html';
 }
 </script>

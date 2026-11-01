@@ -15,6 +15,7 @@ NEXT_NAME = re.compile(
     re.IGNORECASE,
 )
 QUIZ_NAME = re.compile(r"章节测验|章节测试|课后测验|随堂测验|本章测试|单元测验|章节作业|随堂测试")
+PLAY_NAME = re.compile(r"^\s*(?:播放|播放视频|开始播放|Play|Play video|Start video|Воспроизвести)\s*$", re.I)
 ROOT = Path(__file__).resolve().parent
 
 
@@ -31,30 +32,69 @@ def video_state(video):
     }""")
 
 
-def find_video(page, selector="video"):
+def find_video(page, selector="video", play_selector=None):
     """Include nested and cross-origin frames; ignore hidden preload players."""
+    hidden = []
     for frame in page.frames:
         try:
             for video in frame.locator(selector).all():
                 if video.is_visible():
                     return video
+                hidden.append(video)
         except Error:
             # Navigation may detach a frame while enumerating players.
+            continue
+    # Some players hide the media element until their poster's Play is clicked.
+    for video in hidden:
+        try:
+            if find_play_control(video, play_selector) is not None:
+                return video
+        except Error:
             continue
     return None
 
 
-def hover_and_play(page, video, state):
-    video.hover(timeout=2000)
+def find_play_control(video, selector=None):
+    if selector:
+        frame = video.element_handle(timeout=1000).owner_frame()
+        candidates = frame.locator(selector).all() if frame else []
+    else:
+        # Keep automatic clicks within this player's wrapper, away from other videos.
+        wrapper = video.locator("xpath=ancestor::*[contains(concat(' ', normalize-space(@class), ' '), ' video-js ')][1]")
+        if not wrapper.count():
+            wrapper = video.locator("xpath=..")
+        candidates = (wrapper.locator(".vjs-big-play-button, .vjs-play-control").all()
+                      + wrapper.get_by_role("button", name=PLAY_NAME).all())
+    for control in candidates:
+        if control.is_visible() and control.is_enabled():
+            return control
+    return None
+
+
+def point_at_video(page, video):
+    # A poster overlay may intercept hover()/click() on the video itself.
+    if not video.is_visible():
+        return
+    video.scroll_into_view_if_needed(timeout=2000)
     box = video.bounding_box()
     if box:
         page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+
+
+def hover_and_play(page, video, state, play_selector=None):
+    point_at_video(page, video)
     if state["paused"] and not state["ended"] and not state["error"]:
-        # One real click provides the browser's user gesture for media autoplay.
-        video.click(timeout=2000)
-        video.evaluate("v => v.play().catch(() => {})")
-        # A click may reveal controls or scroll the player; recenter afterwards.
-        video.hover(timeout=2000)
+        control = find_play_control(video, play_selector)
+        if control is not None:
+            control.click(timeout=2000)
+            LOG.info("Нажал кнопку воспроизведения. Проверяю запуск видео.")
+        elif state["ready"] >= 1 and not play_selector:
+            # Native HTML5 fallback when the player has no separate Play button.
+            video.click(timeout=2000)
+            error = video.evaluate("async v => { try { await v.play(); return null; } catch(e) { return e.name; } }")
+            if error:
+                LOG.warning("Браузер не запустил видео (%s). Попробую снова.", error)
+        point_at_video(page, video)
 
 
 def click_next(page, selector=None):
@@ -110,11 +150,13 @@ def quiz_page_key(page):
 
 
 class Watcher:
-    def __init__(self, page, next_selector=None, video_selector="video", transition_timeout=45):
+    def __init__(self, page, next_selector=None, video_selector="video", transition_timeout=45, play_selector=None):
         self.page = page
         self.next_selector = next_selector
         self.video_selector = video_selector
         self.transition_timeout = transition_timeout
+        self.play_selector = play_selector
+        self.started = None
         self.current = None
         self.play_attempt = 0.0
         self.pending = None
@@ -155,7 +197,7 @@ class Watcher:
             self.notice_at = now
 
     def tick(self):
-        video = find_video(self.page, self.video_selector)
+        video = find_video(self.page, self.video_selector, self.play_selector)
         if video is None:
             if self.skip_quiz():
                 return
@@ -169,6 +211,7 @@ class Watcher:
             self.current = key
             self.play_attempt = 0.0
             self.manual = False
+            self.started = None
             LOG.info("Найден плеер. Ожидаю загрузку и запускаю воспроизведение.")
 
         # A next button may asynchronously replace the page/frame or reuse a video.
@@ -182,11 +225,11 @@ class Watcher:
                 self.manual = True
                 LOG.warning("После нажатия видео не сменилось. Открой следующий урок вручную.")
             else:
-                video.hover(timeout=2000)
+                point_at_video(self.page, video)
                 return
 
         if state["ended"]:
-            video.hover(timeout=2000)
+            point_at_video(self.page, video)
             if not self.manual:
                 self.completed += 1
                 LOG.info("Видео завершено. Завершённых видео за запуск: %d.", self.completed)
@@ -205,12 +248,15 @@ class Watcher:
         if state["error"]:
             self.notice("Плеер сообщил об ошибке загрузки видео. Проверь страницу вручную.")
             return
-        if state["ready"] >= 1:
-            if state["paused"] and now - self.play_attempt >= 10:
-                self.play_attempt = now
-                hover_and_play(self.page, video, state)
-            else:
-                video.hover(timeout=2000)
+        # Play may be the action which loads metadata, so don't wait for readyState.
+        if state["paused"] and now - self.play_attempt >= 10:
+            self.play_attempt = now
+            hover_and_play(self.page, video, state, self.play_selector)
+        else:
+            point_at_video(self.page, video)
+        if not state["paused"] and state["time"] > 0 and self.started != key:
+            self.started = key
+            LOG.info("Видео воспроизводится.")
         progress = (key, state["time"])
         if progress != self.progress:
             self.progress = progress
@@ -225,6 +271,7 @@ def main():
     parser.add_argument("--url", default="https://mooc2-ans.chaoxing.com/", help="Адрес страницы курса")
     parser.add_argument("--next-selector", help="Playwright/CSS-селектор кнопки следующего урока")
     parser.add_argument("--video-selector", default="video", help="Селектор HTML5-плеера")
+    parser.add_argument("--play-selector", help="Селектор кнопки воспроизведения внутри фрейма плеера")
     parser.add_argument("--profile", type=Path, default=ROOT / ".local" / "browser-profile")
     parser.add_argument("--channel", choices=["chrome", "msedge"], help="Использовать установленный Chrome/Edge")
     parser.add_argument("--poll", type=float, default=1.0, help="Интервал проверки, секунды (минимум 0.2)")
@@ -246,7 +293,7 @@ def main():
                 LOG.warning("Страница загружается долго; продолжаю наблюдение за плеером.")
             LOG.info("Войди в аккаунт и открой первое видео в этой вкладке. "
                      "Оставь окно видимым. Остановка: Ctrl+C или закрытие окна браузера.")
-            watcher = Watcher(page, args.next_selector, args.video_selector)
+            watcher = Watcher(page, args.next_selector, args.video_selector, play_selector=args.play_selector)
             while not page.is_closed():
                 try:
                     watcher.tick()
