@@ -1,0 +1,18 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Video player fixture</title>
+<video width="480" height="270" muted controls preload="auto" src="clip.webm?lesson=1"></video>
+<button id="next" onclick="nextLesson()">下一节</button>
+<form onsubmit="window.quizSubmissions++; return false">
+  <p>章节测验</p>
+  <label><input type="radio" name="answer" value="a">答案 A</label>
+  <button type="submit">提交</button>
+</form>
+<script>
+window.lesson = 1;
+window.quizSubmissions = 0;
+function nextLesson() {
+  window.lesson += 1;
+  document.querySelector('video').src = 'clip.webm?lesson=' + window.lesson;
+}
+</script>
