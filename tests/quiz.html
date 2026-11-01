@@ -1,0 +1,19 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Quiz between videos</title>
+<h1>章节测验</h1>
+<form onsubmit="window.quizSubmissions++; return false">
+  <label><input type="radio" name="answer">答案 A</label>
+  <button type="submit">提交</button>
+</form>
+<button id="next" onclick="nextLesson()">下一节</button>
+<script>
+window.quizSubmissions = 0;
+window.nextClicks = 0;
+function nextLesson() {
+  window.nextClicks++;
+  sessionStorage.setItem('quizAnswered', document.querySelector('input').checked);
+  sessionStorage.setItem('quizSubmissions', window.quizSubmissions);
+  location.href = 'player.html';
+}
+</script>

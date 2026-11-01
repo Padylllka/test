@@ -8,7 +8,7 @@ import threading
 import time
 import unittest
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import Error, sync_playwright
 
 from watch import Watcher, click_next, find_video, video_state
 
@@ -51,11 +51,16 @@ class PlaybackTests(unittest.TestCase):
 
     def until(self, callback, timeout=15):
         deadline = time.monotonic() + timeout
+        last_error = None
         while time.monotonic() < deadline:
-            if callback():
-                return
+            try:
+                if callback():
+                    return
+            except Error as exc:
+                # Match the app loop: frames can detach mid-tick during navigation.
+                last_error = exc
             self.page.wait_for_timeout(50)
-        self.fail("Timed out waiting for expected browser behavior")
+        self.fail(f"Timed out waiting for expected browser behavior: {last_error}")
 
     def test_real_playback_hover_and_next_inside_iframe(self):
         watcher = Watcher(self.page)
@@ -130,6 +135,64 @@ class PlaybackTests(unittest.TestCase):
         self.assertIsNone(find_video(self.page))
         self.assertFalse(click_next(self.page))
         Watcher(self.page).tick()
+
+    def test_video_then_quiz_then_video(self):
+        self.page.frames[1].evaluate("() => { document.querySelector('#next').onclick = "
+                                    "() => location.href = 'quiz.html'; }")
+        watcher = Watcher(self.page)
+
+        def step():
+            watcher.tick()
+            frame = self.page.frames[1]
+            return (frame.url.endswith('player.html')
+                    and frame.evaluate("sessionStorage.getItem('quizSubmissions')") == '0')
+
+        self.until(step)
+        self.assertEqual(watcher.completed, 1)
+        frame = self.page.frames[1]
+        self.assertEqual(frame.evaluate("sessionStorage.getItem('quizAnswered')"), 'false')
+        watcher.tick()
+        video = find_video(self.page)
+        self.until(lambda: video_state(video)["time"] > 0)
+        self.assertFalse(video_state(video)["paused"])
+
+    def test_quiz_transition_not_repeated_and_loading_video_not_skipped(self):
+        frame = self.page.frames[1]
+        frame.goto(self.base + '/quiz.html')
+        frame.evaluate("() => { document.querySelector('#next').onclick = () => window.nextClicks++; }")
+        watcher = Watcher(self.page)
+        watcher.tick()
+        self.assertEqual(frame.evaluate('window.nextClicks'), 0)
+        watcher.quiz_since -= 4
+        watcher.tick()
+        watcher.tick()
+        self.assertEqual(frame.evaluate('window.nextClicks'), 1)
+        self.assertFalse(frame.locator('input').is_checked())
+
+        # A not-yet-visible video means the lesson is still loading, not quiz-only.
+        frame.evaluate("() => { const v = document.createElement('video'); "
+                       "v.style.display = 'none'; document.body.append(v); }")
+        watcher.skipped_quizzes.clear()
+        watcher.tick()
+        self.assertEqual(frame.evaluate('window.nextClicks'), 1)
+
+    def test_sidebar_quiz_label_does_not_skip_loading_frame(self):
+        self.page.frames[1].goto('about:blank')
+        self.page.evaluate("""() => {
+            window.nextClicks = 0;
+            const heading = document.createElement('h1');
+            heading.textContent = '章节测验';
+            document.body.append(heading);
+            const button = document.createElement('button');
+            button.textContent = '下一节';
+            button.onclick = () => window.nextClicks++;
+            document.body.append(button);
+        }""")
+        watcher = Watcher(self.page)
+        watcher.tick()
+        watcher.quiz_since -= 4
+        watcher.tick()
+        self.assertEqual(self.page.evaluate('window.nextClicks'), 0)
 
 
 if __name__ == "__main__":

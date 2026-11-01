@@ -14,6 +14,7 @@ NEXT_NAME = re.compile(
     r"^\s*(?:下一节|下一集|下一章|下一个视频|下一视频|Next video|Next lesson|Следующее видео)\s*$",
     re.IGNORECASE,
 )
+QUIZ_NAME = re.compile(r"章节测验|章节测试|课后测验|随堂测验|本章测试|单元测验|章节作业|随堂测试")
 ROOT = Path(__file__).resolve().parent
 
 
@@ -78,6 +79,36 @@ def click_next(page, selector=None):
     return False
 
 
+def quiz_page_key(page):
+    """Recognize a quiz-only view, while allowing a loading video to appear."""
+    for frame in page.frames:
+        try:
+            for video in frame.locator("video").all():
+                if not video_state(video)["ended"]:
+                    return None
+        except Error:
+            return None
+    for frame in page.frames:
+        try:
+            if frame.parent_frame and not frame.frame_element().is_visible():
+                continue
+            text = frame.locator("body").inner_text(timeout=1000)
+            quiz_url = re.search(r"/(?:work|work-ans)/", frame.url)
+            # A parent course sidebar may mention quizzes while its player loads.
+            if frame.child_frames and not quiz_url:
+                continue
+            questions = frame.locator('input[type="radio"]:visible, input[type="checkbox"]:visible').count()
+            if QUIZ_NAME.search(text) or quiz_url or ("测验" in text and questions):
+                document_id = frame.evaluate("""() => {
+                    window.__watchQuizDocumentId ??= crypto.randomUUID();
+                    return window.__watchQuizDocumentId;
+                }""")
+                return (frame.url, document_id)
+        except Error:
+            continue
+    return None
+
+
 class Watcher:
     def __init__(self, page, next_selector=None, video_selector="video", transition_timeout=45):
         self.page = page
@@ -93,6 +124,29 @@ class Watcher:
         self.progress = None
         self.progress_since = time.monotonic()
         self.notice_at = 0.0
+        self.quiz_candidate = None
+        self.quiz_since = 0.0
+        self.skipped_quizzes = set()
+
+    def skip_quiz(self):
+        key = quiz_page_key(self.page)
+        if key is None:
+            self.quiz_candidate = None
+            return False
+        now = time.monotonic()
+        if key != self.quiz_candidate:
+            self.quiz_candidate = key
+            self.quiz_since = now
+        # Do not click during transient navigation or repeatedly on a blocked quiz.
+        if now - self.quiz_since < 3 or key in self.skipped_quizzes:
+            return True
+        if click_next(self.page, self.next_selector):
+            self.skipped_quizzes.add(key)
+            self.pending = None
+            LOG.info("Открыт тест без видео. Нажал 下一节, ответы оставлены пустыми.")
+        else:
+            self.notice("Открыт тест, но 下一节 недоступна. Жду доступной кнопки или ручного перехода.")
+        return True
 
     def notice(self, message):
         now = time.monotonic()
@@ -103,8 +157,11 @@ class Watcher:
     def tick(self):
         video = find_video(self.page, self.video_selector)
         if video is None:
+            if self.skip_quiz():
+                return
             self.notice("Видео не найдено. Войди в аккаунт и открой нужный урок в этом окне.")
             return
+        self.quiz_candidate = None
         state = video_state(video)
         key = (state["id"], state["src"])
         now = time.monotonic()
