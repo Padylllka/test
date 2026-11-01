@@ -1,6 +1,7 @@
 """Visible browser playback assistant. Run `python watch.py --help`."""
 
 import argparse
+import json
 import logging
 from pathlib import Path
 import re
@@ -16,7 +17,13 @@ NEXT_NAME = re.compile(
 )
 QUIZ_NAME = re.compile(r"章节测验|章节测试|课后测验|随堂测验|本章测试|单元测验|章节作业|随堂测试")
 PLAY_NAME = re.compile(r"^\s*(?:播放|播放视频|开始播放|Play|Play video|Start video|Воспроизвести)\s*$", re.I)
-UNFINISHED_NOTICE = re.compile(r"当前章节还有任务点未完成\s*[，,]\s*是否去完成\s*[?？]?")
+TEXT_GAP = r"[\s\u200b\u200c\u200d\ufeff]*"
+UNFINISHED_NOTICE = re.compile(
+    TEXT_GAP.join("当前章节还有任务点未完成")
+    + r"[\s，,。:：\u200b\ufeff]*" + TEXT_GAP.join("是否去完成")
+)
+NOTICE_NEXT = re.compile(r"^" + TEXT_GAP + TEXT_GAP.join("下一节") + TEXT_GAP + r"$")
+VERSION = "1.3.0"
 ROOT = Path(__file__).resolve().parent
 
 
@@ -163,25 +170,56 @@ def unfinished_notices(page):
                         window.__watchNoticeIds.set(e, crypto.randomUUID());
                     return window.__watchNoticeIds.get(e);
                 }""")
-                # No dependency on modal CSS classes or ARIA roles. Do not search
-                # the whole page: it may have a different 下一节 behind the modal.
-                container = message.locator(
-                    "xpath=ancestor::*[not(self::body) and not(self::html)]"
-                    "[.//*[normalize-space(.)='下一节']][1]"
-                )
+                # Find the closest shared wrapper, including spaced labels,
+                # nested spans and input buttons. Never search the whole page.
                 control = None
-                if container.count():
-                    for candidate in container.get_by_text(re.compile(r"^\s*下一节\s*$")).all():
+                container = message
+                for _ in range(10):
+                    container = container.locator("xpath=..")
+                    if not container.count() or container.evaluate("e => ['BODY', 'HTML'].includes(e.tagName)"):
+                        break
+                    candidates = (container.get_by_role("button", name=NOTICE_NEXT).all()
+                                  + container.get_by_role("link", name=NOTICE_NEXT).all()
+                                  + container.get_by_text(NOTICE_NEXT).all())
+                    for candidate in candidates:
                         if candidate.is_visible() and candidate.is_enabled():
                             control = candidate
                             break
+                    if control is not None:
+                        break
                 yield key, control
         except Error:
             continue
 
 
+def notice_diagnostics(page):
+    """Bounded UI labels only: no URLs, cookies, input values or page HTML."""
+    result = []
+    for index, frame in enumerate(page.frames):
+        try:
+            labels = frame.evaluate(r"""() => {
+                const compact = s => s.replace(/[\s\u200b\u200c\u200d\ufeff]/gu, '');
+                return [...document.querySelectorAll('body *')].flatMap(e => {
+                    const text = e.tagName === 'INPUT' ? '' : compact(e.textContent || '');
+                    const label = compact(e.getAttribute('aria-label') || '');
+                    if (text.length > 140 || !/任务点|是否去完成|下一节/.test(text + label)) return [];
+                    const r = e.getBoundingClientRect();
+                    const style = getComputedStyle(e);
+                    return [{tag: e.tagName, role: e.getAttribute('role'),
+                        class: String(e.className || '').slice(0, 100),
+                        text: text.slice(0, 140), label: label.slice(0, 50),
+                        visible: r.width > 0 && r.height > 0 && style.visibility !== 'hidden'}];
+                }).slice(0, 20);
+            }""")
+            if labels:
+                result.append({"frame": index, "labels": labels})
+        except Error:
+            result.append({"frame": index, "state": "changing"})
+    return result
+
+
 class Watcher:
-    def __init__(self, page, next_selector=None, video_selector="video", transition_timeout=45, play_selector=None):
+    def __init__(self, page, next_selector=None, video_selector="video", transition_timeout=45, play_selector=None, diagnose_notice=False):
         self.page = page
         self.next_selector = next_selector
         self.video_selector = video_selector
@@ -201,6 +239,8 @@ class Watcher:
         self.quiz_since = 0.0
         self.skipped_quizzes = set()
         self.confirmed_notices = set()
+        self.diagnose_notice = diagnose_notice
+        self.diagnostic_at = 0.0
 
     def confirm_unfinished_notice(self):
         notices = list(unfinished_notices(self.page))
@@ -212,7 +252,11 @@ class Watcher:
             if control is None:
                 self.notice("Есть уведомление о незавершённых заданиях; жду кнопку 下一节 внутри окна.")
                 continue
-            control.click(timeout=3000)
+            try:
+                control.click(timeout=3000)
+            except Error as exc:
+                self.notice("Нашёл кнопку в уведомлении, но нажатие не удалось: " + type(exc).__name__)
+                continue
             self.confirmed_notices.add(key)
             self.pending_since = time.monotonic()
             LOG.info("Уведомление о незавершённых заданиях: нажал 下一节 внутри окна.")
@@ -246,6 +290,9 @@ class Watcher:
             self.notice_at = now
 
     def tick(self):
+        if self.diagnose_notice and time.monotonic() - self.diagnostic_at >= 30:
+            self.diagnostic_at = time.monotonic()
+            LOG.info("Диагностика уведомления: %s", json.dumps(notice_diagnostics(self.page), ensure_ascii=False))
         # The modal blocks the player and navigation, so handle it first.
         if self.confirm_unfinished_notice():
             return
@@ -324,6 +371,7 @@ def main():
     parser.add_argument("--next-selector", help="Playwright/CSS-селектор кнопки следующего урока")
     parser.add_argument("--video-selector", default="video", help="Селектор HTML5-плеера")
     parser.add_argument("--play-selector", help="Селектор кнопки воспроизведения внутри фрейма плеера")
+    parser.add_argument("--diagnose-notice", action="store_true", help="Выводить краткую диагностику уведомления каждые 30 секунд")
     parser.add_argument("--profile", type=Path, default=ROOT / ".local" / "browser-profile")
     parser.add_argument("--channel", choices=["chrome", "msedge"], help="Использовать установленный Chrome/Edge")
     parser.add_argument("--poll", type=float, default=1.0, help="Интервал проверки, секунды (минимум 0.2)")
@@ -331,6 +379,7 @@ def main():
     if args.poll < 0.2:
         parser.error("--poll должен быть не меньше 0.2")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s", datefmt="%H:%M:%S")
+    LOG.info("Версия скрипта: %s", VERSION)
     args.profile.mkdir(parents=True, exist_ok=True)
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
@@ -345,7 +394,8 @@ def main():
                 LOG.warning("Страница загружается долго; продолжаю наблюдение за плеером.")
             LOG.info("Войди в аккаунт и открой первое видео в этой вкладке. "
                      "Оставь окно видимым. Остановка: Ctrl+C или закрытие окна браузера.")
-            watcher = Watcher(page, args.next_selector, args.video_selector, play_selector=args.play_selector)
+            watcher = Watcher(page, args.next_selector, args.video_selector,
+                              play_selector=args.play_selector, diagnose_notice=args.diagnose_notice)
             while not page.is_closed():
                 try:
                     watcher.tick()

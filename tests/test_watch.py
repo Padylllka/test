@@ -10,7 +10,7 @@ import unittest
 
 from playwright.sync_api import Error, sync_playwright
 
-from watch import Watcher, click_next, find_video, video_state
+from watch import Watcher, click_next, find_video, video_state, notice_diagnostics
 
 
 HERE = Path(__file__).resolve().parent
@@ -287,6 +287,39 @@ class PlaybackTests(unittest.TestCase):
         watcher.tick()
         self.assertEqual(self.page.evaluate('window.confirmClicks'), 0)
         self.assertEqual(self.page.evaluate('window.studyClicks'), 0)
+
+    def test_notice_with_spaced_labels_split_text_and_input_button(self):
+        variants = [
+            '<button id="confirm-next"><span>下</span> <span>一</span> <span>节</span></button>',
+            '<a id="confirm-next">下&nbsp;一&nbsp;节</a>',
+            '<button id="confirm-next">下&#8203;一&#8203;节</button>',
+            '<input id="confirm-next" type="button" value="下 一 节">',
+        ]
+        for markup in variants:
+            with self.subTest(markup=markup):
+                self.page.goto(self.base + '/notice.html')
+                self.page.locator('#notice p').evaluate("""e => {
+                    e.innerHTML = '<span>当前章节还有</span> <b>任务点未完成</b>，<span>是否去完成？</span>';
+                }""")
+                self.page.locator('#confirm-next').evaluate('(e, html) => e.outerHTML = html', markup)
+                self.page.locator('#confirm-next').evaluate('e => e.onclick = () => window.confirmClicks++')
+                watcher = Watcher(self.page)
+                watcher.tick()
+                watcher.tick()
+                self.assertEqual(self.page.evaluate('window.confirmClicks'), 1)
+                self.assertEqual(self.page.evaluate('window.studyClicks'), 0)
+                self.assertEqual(self.page.evaluate('window.backgroundClicks'), 0)
+
+    def test_notice_diagnostics_include_labels_but_no_url_or_secret_inputs(self):
+        self.page.goto(self.base + '/notice.html?private=do-not-export')
+        self.page.evaluate("""() => {
+            const input = document.createElement('input');
+            input.type = 'password'; input.value = 'secret-do-not-export';
+            document.body.append(input);
+        }""")
+        report = str(notice_diagnostics(self.page))
+        self.assertIn('下一节', report)
+        self.assertNotIn('do-not-export', report)
 
 
 if __name__ == "__main__":
